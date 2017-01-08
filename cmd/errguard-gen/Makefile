@@ -1,6 +1,6 @@
 
 
 all:
-	go install
+	go install -gcflags "-N -l"
 	go generate ./testdata
 

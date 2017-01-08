@@ -1,12 +1,13 @@
 package main
 
 import (
-	"go/ast"
 	"go/parser"
 	"go/token"
 	"log"
 	"os"
 
+	"github.com/jjeffery/errguard/gen"
+	"github.com/kr/pretty"
 	"github.com/spf13/pflag"
 )
 
@@ -21,6 +22,14 @@ func main() {
 	pflag.Parse()
 	if option.Type == "" {
 		log.Fatal("missing --type option")
+	}
+
+	if d := os.Getenv("DEBUGCD"); d != "" {
+		pwd, _ := os.Getwd()
+		log.Print(pwd)
+		if err := os.Chdir(d); err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	log.Println("environment:")
@@ -41,27 +50,18 @@ func main() {
 		log.Fatal(err)
 	}
 
-	for _, decl := range file.Decls {
-		if genDecl, ok := decl.(*ast.GenDecl); ok {
-			for _, spec := range genDecl.Specs {
-				if typeSpec, ok := spec.(*ast.TypeSpec); ok {
-					if typeSpec.Name.Name == option.Type {
-						_, ok := typeSpec.Type.(*ast.InterfaceType)
-						if !ok {
-							log.Fatalf("Type %s is not an interface", option.Type)
-						}
-						/*
-							for _, field := range interfaceType.Methods.List {
-								for _, ident := range field.Names {
-									log.Println(ident.Name)
-								}
-							}
-						*/
-						ast.Print(fset, typeSpec)
-					}
-				}
-			}
-		}
+	model, err := gen.NewModel(file, []string{option.Type})
+	if err != nil {
+		log.Fatal(err)
 	}
+	pretty.Print(model)
+	/*
+		log.Println("interface", intf.Name)
+		for _, method := range intf.Methods {
+			log.Printf("%s(%s) (%s)", method.Name, method.ParamDecl, method.ResultDecl)
+			log.Printf("(%s) (%s)", method.ArgNames, method.ResultNames)
+			log.Printf("Error var = %q", method.ErrorVar)
+			log.Printf("Context expr = %q", method.ContextExpr)
+		}*/
 
 }

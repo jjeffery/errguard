@@ -4,79 +4,106 @@ package gen
 import (
 	"fmt"
 	"go/ast"
+	"log"
 	"strconv"
 	"strings"
 
 	"github.com/jjeffery/stringset"
 )
 
+// Model contains all of the information required to generate the file.
+type Model struct {
+	Package    string
+	Imports    []*Import
+	Interfaces []*Interface
+	// TODO: functions
+}
+
+// Import describes a single import line required for the generated file.
+type Import struct {
+	Name string // Local name, or blank
+	Path string
+}
+
 // Interface contains information about a single interface needed by the template
 type Interface struct {
-	TypeSpec      *ast.TypeSpec
-	InterfaceType *ast.InterfaceType
-	Name          string
-	Methods       []*Method
+	Name    string
+	Methods []*Method
 }
 
 // Method contains information about a single method needed by the template.
 type Method struct {
-	Interface   *Interface
-	Field       *ast.Field
 	Name        string
-	ArgNames    string // Comma separated list of argument names
+	ArgNames    string // Comma separated list of input argument names
 	ParamDecl   string // Parameters and types for method declaration
-	ReturnNames string // Comma separated list of returns names
-	ReturnDecl  string // Returns for method declaration
-	Params      ParamList
-	Returns     ParamList
+	ResultNames string // Comma separated list of result names
+	ResultDecl  string // Results for method declaration
+	ErrorVar    string // Name of the result error var
+	ContextExpr string // Expression to use to obtain the context
 }
 
-type ParamList []*Param
+type importResolver struct {
+	imports []*ast.ImportSpec
+	used    map[string]*Import
+}
 
-func (pl ParamList) String() string {
-	v := make([]string, len(pl))
-	for i, p := range pl {
-		v[i] = p.String()
+func newImportResolver(imports []*ast.ImportSpec) (*importResolver, error) {
+	for _, importSpec := range imports {
+		if importSpec.Name != nil && importSpec.Name.Name == "." {
+			return nil, fmt.Errorf("dot imports are not supported: . %v", importSpec.Path.Value)
+		}
 	}
-	return strings.Join(v, ", ")
+	return &importResolver{
+		imports: imports,
+		used:    make(map[string]*Import),
+	}, nil
 }
 
-type Param struct {
-	Name     string // might be blank
-	TypeName string
-}
-
-func (p *Param) String() string {
-	if p.Name == "" {
-		return p.TypeName
+// NewModel returns a model suitable for generating code from the information in
+// the file AST and the list of names to generate code for. Each name should be
+// the name of an interface or a function.
+func NewModel(file *ast.File, names []string) (*Model, error) {
+	model := &Model{
+		Package: file.Name.Name,
 	}
-	return p.Name + " " + p.TypeName
-}
 
-func MakeModel(file *ast.File, interfaceName string) (*Interface, error) {
+	for _, importSpec := range file.Imports {
+		if importSpec.Name != nil && importSpec.Name.Name == "." {
+			return nil, fmt.Errorf("dot imports are not supported: . %v", importSpec.Path.Value)
+		}
+	}
+	nameSet := stringset.New(names...)
 	for _, decl := range file.Decls {
 		if genDecl, ok := decl.(*ast.GenDecl); ok {
 			for _, spec := range genDecl.Specs {
 				if typeSpec, ok := spec.(*ast.TypeSpec); ok {
-					if typeSpec.Name.Name == interfaceName {
+					name := typeSpec.Name.Name
+					if nameSet.Contains(name) {
 						interfaceType, ok := typeSpec.Type.(*ast.InterfaceType)
 						if !ok {
-							return nil, fmt.Errorf("type %s is not an interface", interfaceName)
+							return nil, fmt.Errorf("type %s is not an interface", name)
 						}
-						return newInterface(typeSpec, interfaceType), nil
+						model.Interfaces = append(model.Interfaces, newInterface(typeSpec, interfaceType))
 					}
 				}
 			}
 		}
+		if funcDecl, ok := decl.(*ast.FuncDecl); ok {
+			// only interested in functions, not methods
+			if funcDecl.Recv == nil {
+				name := funcDecl.Name.Name
+				if nameSet.Contains(name) {
+					return nil, fmt.Errorf("found func %s, but functions are not supported yet", name)
+				}
+			}
+		}
 	}
-	return nil, fmt.Errorf("type %s not found", interfaceName)
+	return model, nil
 }
 
 func newInterface(typeSpec *ast.TypeSpec, interfaceType *ast.InterfaceType) *Interface {
 	intf := &Interface{
-		TypeSpec:      typeSpec,
-		InterfaceType: interfaceType,
-		Name:          typeSpec.Name.Name,
+		Name: typeSpec.Name.Name,
 	}
 	for _, field := range interfaceType.Methods.List {
 		method := newMethod(intf, field)
@@ -88,9 +115,7 @@ func newInterface(typeSpec *ast.TypeSpec, interfaceType *ast.InterfaceType) *Int
 
 func newMethod(intf *Interface, field *ast.Field) *Method {
 	method := &Method{
-		Interface: intf,
-		Field:     field,
-		Name:      field.Names[0].Name,
+		Name: field.Names[0].Name,
 	}
 	funcType := field.Type.(*ast.FuncType)
 
@@ -98,14 +123,18 @@ func newMethod(intf *Interface, field *ast.Field) *Method {
 	// assign unique ones for anonymous fields
 	allNames := stringset.New()
 	{
-		for _, paramField := range funcType.Params.List {
-			for _, ident := range paramField.Names {
-				allNames.Add(ident.Name)
+		if funcType.Params != nil {
+			for _, paramField := range funcType.Params.List {
+				for _, ident := range paramField.Names {
+					allNames.Add(ident.Name)
+				}
 			}
 		}
-		for _, resultField := range funcType.Results.List {
-			for _, ident := range resultField.Names {
-				allNames.Add(ident.Name)
+		if funcType.Results != nil {
+			for _, resultField := range funcType.Results.List {
+				for _, ident := range resultField.Names {
+					allNames.Add(ident.Name)
+				}
 			}
 		}
 	}
@@ -114,43 +143,61 @@ func newMethod(intf *Interface, field *ast.Field) *Method {
 	var paramDecls []string
 	var resultNames []string
 	var resultDecls []string
+	var errorVar string
+	var contextExpr string
 
-	for _, paramField := range funcType.Params.List {
-		typeString := exprString(paramField.Type)
-		var names []string
-		for _, ident := range paramField.Names {
-			names = append(names, ident.Name)
+	if funcType.Params.List != nil {
+		for _, paramField := range funcType.Params.List {
+			typeString := exprString(paramField.Type)
+			var names []string
+			for _, ident := range paramField.Names {
+				names = append(names, ident.Name)
+			}
+			if len(names) == 0 {
+				names = append(names, newParamName(allNames, typeString))
+			}
+			argNames = append(argNames, names...)
+			paramDecl := fmt.Sprintf("%s %s", strings.Join(names, ", "), typeString)
+			paramDecls = append(paramDecls, paramDecl)
+			if typeString == "context.Context" {
+				contextExpr = names[0]
+			}
 		}
-		if len(names) == 0 {
-			names = append(names, newParamName(allNames, typeString))
-		}
-		argNames = append(argNames, names...)
-		paramDecl := fmt.Sprintf("%s %s", strings.Join(argNames, ", "), typeString)
-		paramDecls = append(paramDecls, paramDecl)
 	}
-	for _, resultField := range funcType.Results.List {
-		typeString := exprString(resultField.Type)
-		var names []string
-		for _, ident := range resultField.Names {
-			names = append(names, ident.Name)
+	if funcType.Results != nil {
+		for _, resultField := range funcType.Results.List {
+			typeString := exprString(resultField.Type)
+			var names []string
+			for _, ident := range resultField.Names {
+				names = append(names, ident.Name)
+			}
+			if len(names) == 0 {
+				names = append(names, newParamName(allNames, typeString))
+			}
+			resultNames = append(resultNames, names...)
+			resultDecl := fmt.Sprintf("%s %s", strings.Join(names, ", "), typeString)
+			resultDecls = append(resultDecls, resultDecl)
+			if typeString == "error" {
+				errorVar = names[0]
+			}
 		}
-		if len(names) == 0 {
-			names = append(names, newParamName(allNames, typeString))
-		}
-		resultNames = append(resultNames, names...)
-		resultDecl := fmt.Sprintf("%s %s", strings.Join(argNames, ", "), typeString)
-		resultDecls = append(resultDecls, resultDecl)
 	}
 
 	method.ArgNames = strings.Join(argNames, ", ")
-	method.ReturnNames = strings.Join(resultNames, ", ")
+	method.ResultNames = strings.Join(resultNames, ", ")
 	method.ParamDecl = strings.Join(paramDecls, ", ")
-	method.ReturnDecl = strings.Join(resultDecls, ", ")
+	method.ResultDecl = strings.Join(resultDecls, ", ")
+	method.ErrorVar = errorVar
+	if contextExpr == "" {
+		contextExpr = "context.TODO()"
+	}
+	method.ContextExpr = contextExpr
 
 	return method
 }
 
 func newParamName(names stringset.Set, typeString string) string {
+	log.Printf("newParamName(names, %s)", typeString)
 	var name string
 	switch {
 	case typeString == "error":
@@ -170,23 +217,17 @@ func newParamName(names stringset.Set, typeString string) string {
 	}
 	if !names.Contains(name) {
 		names.Add(name)
+		log.Printf("return %s", name)
 		return name
 	}
 	for i := 1; ; i++ {
 		namen := name + strconv.Itoa(i)
 		if !names.Contains(namen) {
 			names.Add(namen)
+			log.Printf("return %s", namen)
 			return namen
 		}
 	}
-}
-
-func newParam(method *Method, field *ast.Field) *Param {
-	param := &Param{
-	//Method: method,
-	//Field:  field,
-	}
-	return param
 }
 
 func exprString(t ast.Expr) string {

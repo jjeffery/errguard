@@ -6,7 +6,7 @@ import "context"
 
 type Service interface {
 	DoSomething(context.Context, *DoSomethingInput) (*DoSomethingOutput, error)
-	Varargs(context.Context, <-chan string)
+	Varargs(<-chan string) error
 }
 
 type DoSomethingInput struct {
