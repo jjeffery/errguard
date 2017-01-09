@@ -1,7 +1,7 @@
 package testdata
 
 import (
-	"bytes"
+	bbb "bytes"
 	"context"
 	"time"
 )
@@ -11,7 +11,7 @@ import (
 type Service interface {
 	DoSomething(context.Context, *DoSomethingInput) (*DoSomethingOutput, error)
 	NoArgs() error
-	ExternPackage(time.Time) (*bytes.Buffer, error)
+	ExternPackage(time.Time) (*bbb.Buffer, error)
 }
 
 type DoSomethingInput struct {

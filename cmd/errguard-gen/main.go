@@ -46,6 +46,8 @@ func main() {
 		log.Fatal(err)
 	}
 
+	model.CommandLine = strings.Join(os.Args, " ")
+
 	var buf bytes.Buffer
 	if err := gen.DefaultTemplate.Execute(&buf, model); err != nil {
 		log.Fatal(err)
