@@ -4,9 +4,10 @@ package gen
 import (
 	"fmt"
 	"go/ast"
-	"log"
+	"path"
 	"strconv"
 	"strings"
+	"text/template"
 
 	"github.com/jjeffery/stringset"
 )
@@ -25,6 +26,13 @@ type Import struct {
 	Path string
 }
 
+func (imp *Import) String() string {
+	if imp.Name != "" {
+		return fmt.Sprintf("%s %s", imp.Name, imp.Path)
+	}
+	return imp.Path
+}
+
 // Interface contains information about a single interface needed by the template
 type Interface struct {
 	Name    string
@@ -33,6 +41,7 @@ type Interface struct {
 
 // Method contains information about a single method needed by the template.
 type Method struct {
+	Interface   *Interface
 	Name        string
 	ArgNames    string // Comma separated list of input argument names
 	ParamDecl   string // Parameters and types for method declaration
@@ -45,6 +54,142 @@ type Method struct {
 type importResolver struct {
 	imports []*ast.ImportSpec
 	used    map[string]*Import
+}
+
+func (r *importResolver) Resolve(name string) *Import {
+	if imp, ok := r.used[name]; ok {
+		return imp
+	}
+
+	// strips the quotes from the import path and returns the base name
+	pathBase := func(p string) string {
+		return path.Base(strings.TrimPrefix(strings.TrimSuffix(p, `"`), `"`))
+	}
+	// strips the quotes from the import path and returns the base name without any extension
+	// (good for import paths like "gopkg.in/xyz/abc.v1")
+	pathBaseWithoutExtension := func(p string) string {
+		p = pathBase(p)
+		return strings.TrimSuffix(p, path.Ext(p))
+	}
+
+	tests := []func(*ast.ImportSpec) bool{
+		// import has matching explicit name
+		func(is *ast.ImportSpec) bool {
+			return is.Name != nil && is.Name.Name == name
+		},
+		// import has matching import base name
+		func(is *ast.ImportSpec) bool {
+			if is.Name != nil {
+				return false
+			}
+			return pathBase(is.Path.Value) == name
+		},
+		// import has matching import base name without extension
+		func(is *ast.ImportSpec) bool {
+			if is.Name != nil {
+				return false
+			}
+			return pathBaseWithoutExtension(is.Path.Value) == name
+		},
+		// import base name contains the string somewhere
+		func(is *ast.ImportSpec) bool {
+			if is.Name != nil {
+				return false
+			}
+			return strings.Contains(pathBase(is.Path.Value), name)
+		},
+	}
+	// Search for an import whose name matches.
+	for _, test := range tests {
+		for _, importSpec := range r.imports {
+			if test(importSpec) {
+				imp := &Import{
+					Path: importSpec.Path.Value,
+				}
+				if importSpec.Name != nil {
+					imp.Name = importSpec.Name.Name
+				}
+
+				r.used[name] = imp
+				return imp
+			}
+		}
+	}
+	return nil
+}
+
+func (r *importResolver) exprString(t ast.Expr) string {
+	if t == nil {
+		return ""
+	}
+	switch v := t.(type) {
+	case *ast.BadExpr:
+		return "<bad-expr>"
+	case *ast.Ident:
+		return v.Name
+	case *ast.Ellipsis:
+		return fmt.Sprintf("...%s", r.exprString(v.Elt))
+	case *ast.BasicLit:
+		// does not appear in method declarations
+		return v.Value
+	case *ast.FuncLit:
+		notExpecting("FuncLit")
+	case *ast.CompositeLit:
+		notExpecting("CompositeLit")
+	case *ast.ParenExpr:
+		return fmt.Sprintf("(%s)", r.exprString(v.X))
+	case *ast.SelectorExpr:
+		r.Resolve(r.exprString(v.X))
+		return fmt.Sprintf("%s.%s", r.exprString(v.X), v.Sel.Name)
+	case *ast.IndexExpr:
+		return fmt.Sprintf("%s[%s]", r.exprString(v.X), r.exprString(v.Index))
+	case *ast.SliceExpr:
+		if v.Slice3 {
+			return fmt.Sprintf("%s[%s:%s]", r.exprString(v.X), r.exprString(v.Low), r.exprString(v.High))
+		}
+		return fmt.Sprintf("%s[%s:%s:%s]", r.exprString(v.X), r.exprString(v.Low), r.exprString(v.High), r.exprString(v.Max))
+	case *ast.TypeAssertExpr:
+		notExpecting("TypeAssertExpr")
+	case *ast.CallExpr:
+		notExpecting("CallExpr")
+	case *ast.StarExpr:
+		return fmt.Sprintf("*%s", r.exprString(v.X))
+	case *ast.UnaryExpr:
+		return fmt.Sprintf("%s%s", v.Op.String(), r.exprString(v.X))
+	case *ast.BinaryExpr:
+		return fmt.Sprintf("%s %s %s", r.exprString(v.X), v.Op.String(), r.exprString(v.Y))
+	case *ast.KeyValueExpr:
+		return fmt.Sprintf("%s: %s", r.exprString(v.Key), r.exprString(v.Value))
+	case *ast.ArrayType:
+		return fmt.Sprintf("[%s]%s", r.exprString(v.Len), r.exprString(v.Elt))
+	case *ast.StructType:
+		notImplemented("StructType")
+	case *ast.FuncType:
+		notImplemented("FuncType")
+	case *ast.InterfaceType:
+		notImplemented("InterfaceType")
+	case *ast.MapType:
+		return fmt.Sprintf("map[%s]%s", r.exprString(v.Key), r.exprString(v.Value))
+	case *ast.ChanType:
+		switch v.Dir {
+		case ast.SEND:
+			return fmt.Sprintf("chan<- %s", r.exprString(v.Value))
+		case ast.RECV:
+			return fmt.Sprintf("<-chan %s", r.exprString(v.Value))
+		default:
+			return fmt.Sprintf("chan %s", r.exprString(v.Value))
+		}
+	}
+
+	panic(fmt.Sprintf("unknown ast.Expr: %v", t))
+}
+
+func (r *importResolver) Imports() []*Import {
+	var imports []*Import
+	for _, imp := range r.used {
+		imports = append(imports, imp)
+	}
+	return imports
 }
 
 func newImportResolver(imports []*ast.ImportSpec) (*importResolver, error) {
@@ -66,12 +211,11 @@ func NewModel(file *ast.File, names []string) (*Model, error) {
 	model := &Model{
 		Package: file.Name.Name,
 	}
-
-	for _, importSpec := range file.Imports {
-		if importSpec.Name != nil && importSpec.Name.Name == "." {
-			return nil, fmt.Errorf("dot imports are not supported: . %v", importSpec.Path.Value)
-		}
+	ir, err := newImportResolver(file.Imports)
+	if err != nil {
+		return nil, err
 	}
+
 	nameSet := stringset.New(names...)
 	for _, decl := range file.Decls {
 		if genDecl, ok := decl.(*ast.GenDecl); ok {
@@ -83,7 +227,7 @@ func NewModel(file *ast.File, names []string) (*Model, error) {
 						if !ok {
 							return nil, fmt.Errorf("type %s is not an interface", name)
 						}
-						model.Interfaces = append(model.Interfaces, newInterface(typeSpec, interfaceType))
+						model.Interfaces = append(model.Interfaces, newInterface(ir, typeSpec, interfaceType))
 					}
 				}
 			}
@@ -98,24 +242,42 @@ func NewModel(file *ast.File, names []string) (*Model, error) {
 			}
 		}
 	}
+	model.Imports = ir.Imports()
+
+	// check for functions/methods that do not return an error
+	{
+		var missingErrs []string
+		for _, intf := range model.Interfaces {
+			for _, method := range intf.Methods {
+				if method.ErrorVar == "" {
+					missingErrs = append(missingErrs, fmt.Sprintf("%s.%s", intf.Name, method.Name))
+				}
+			}
+		}
+		if missingErrs != nil {
+			return nil, fmt.Errorf("method does not return an error: %s", strings.Join(missingErrs, ", "))
+		}
+	}
+
 	return model, nil
 }
 
-func newInterface(typeSpec *ast.TypeSpec, interfaceType *ast.InterfaceType) *Interface {
+func newInterface(ir *importResolver, typeSpec *ast.TypeSpec, interfaceType *ast.InterfaceType) *Interface {
 	intf := &Interface{
 		Name: typeSpec.Name.Name,
 	}
 	for _, field := range interfaceType.Methods.List {
-		method := newMethod(intf, field)
+		method := newMethod(ir, intf, field)
 		intf.Methods = append(intf.Methods, method)
 	}
 
 	return intf
 }
 
-func newMethod(intf *Interface, field *ast.Field) *Method {
+func newMethod(ir *importResolver, intf *Interface, field *ast.Field) *Method {
 	method := &Method{
-		Name: field.Names[0].Name,
+		Interface: intf,
+		Name:      field.Names[0].Name,
 	}
 	funcType := field.Type.(*ast.FuncType)
 
@@ -148,7 +310,7 @@ func newMethod(intf *Interface, field *ast.Field) *Method {
 
 	if funcType.Params.List != nil {
 		for _, paramField := range funcType.Params.List {
-			typeString := exprString(paramField.Type)
+			typeString := ir.exprString(paramField.Type)
 			var names []string
 			for _, ident := range paramField.Names {
 				names = append(names, ident.Name)
@@ -166,7 +328,7 @@ func newMethod(intf *Interface, field *ast.Field) *Method {
 	}
 	if funcType.Results != nil {
 		for _, resultField := range funcType.Results.List {
-			typeString := exprString(resultField.Type)
+			typeString := ir.exprString(resultField.Type)
 			var names []string
 			for _, ident := range resultField.Names {
 				names = append(names, ident.Name)
@@ -197,7 +359,6 @@ func newMethod(intf *Interface, field *ast.Field) *Method {
 }
 
 func newParamName(names stringset.Set, typeString string) string {
-	log.Printf("newParamName(names, %s)", typeString)
 	var name string
 	switch {
 	case typeString == "error":
@@ -217,82 +378,15 @@ func newParamName(names stringset.Set, typeString string) string {
 	}
 	if !names.Contains(name) {
 		names.Add(name)
-		log.Printf("return %s", name)
 		return name
 	}
 	for i := 1; ; i++ {
 		namen := name + strconv.Itoa(i)
 		if !names.Contains(namen) {
 			names.Add(namen)
-			log.Printf("return %s", namen)
 			return namen
 		}
 	}
-}
-
-func exprString(t ast.Expr) string {
-	if t == nil {
-		return ""
-	}
-	switch v := t.(type) {
-	case *ast.BadExpr:
-		return "<bad-expr>"
-	case *ast.Ident:
-		return v.Name
-	case *ast.Ellipsis:
-		return fmt.Sprintf("...%s", exprString(v.Elt))
-	case *ast.BasicLit:
-		// does not appear in method declarations
-		return v.Value
-	case *ast.FuncLit:
-		notExpecting("FuncLit")
-	case *ast.CompositeLit:
-		notExpecting("CompositeLit")
-	case *ast.ParenExpr:
-		return fmt.Sprintf("(%s)", exprString(v.X))
-	case *ast.SelectorExpr:
-		return fmt.Sprintf("%s.%s", exprString(v.X), v.Sel.Name)
-	case *ast.IndexExpr:
-		return fmt.Sprintf("%s[%s]", exprString(v.X), exprString(v.Index))
-	case *ast.SliceExpr:
-		if v.Slice3 {
-			return fmt.Sprintf("%s[%s:%s]", exprString(v.X), exprString(v.Low), exprString(v.High))
-		}
-		return fmt.Sprintf("%s[%s:%s:%s]", exprString(v.X), exprString(v.Low), exprString(v.High), exprString(v.Max))
-	case *ast.TypeAssertExpr:
-		notExpecting("TypeAssertExpr")
-	case *ast.CallExpr:
-		notExpecting("CallExpr")
-	case *ast.StarExpr:
-		return fmt.Sprintf("*%s", exprString(v.X))
-	case *ast.UnaryExpr:
-		return fmt.Sprintf("%s%s", v.Op.String(), exprString(v.X))
-	case *ast.BinaryExpr:
-		return fmt.Sprintf("%s %s %s", exprString(v.X), v.Op.String(), exprString(v.Y))
-	case *ast.KeyValueExpr:
-		return fmt.Sprintf("%s: %s", exprString(v.Key), exprString(v.Value))
-	case *ast.ArrayType:
-		return fmt.Sprintf("[%s]%s", exprString(v.Len), exprString(v.Elt))
-	case *ast.StructType:
-		notImplemented("StructType")
-	case *ast.FuncType:
-		notImplemented("FuncType")
-	case *ast.InterfaceType:
-		notImplemented("InterfaceType")
-	case *ast.MapType:
-		return fmt.Sprintf("map[%s]%s", exprString(v.Key), exprString(v.Value))
-	case *ast.ChanType:
-		switch v.Dir {
-		case ast.SEND:
-			return fmt.Sprintf("chan<- %s", exprString(v.Value))
-		case ast.RECV:
-			return fmt.Sprintf("<-chan %s", exprString(v.Value))
-		default:
-			return fmt.Sprintf("chan %s", exprString(v.Value))
-		}
-	}
-
-	panic(fmt.Sprintf("unknown ast.Expr: %v", t))
 }
 
 func notExpecting(nodeType string) {
@@ -304,3 +398,33 @@ func notImplemented(nodeType string) {
 	msg := fmt.Sprintf("handling of node type not implemented: %s", nodeType)
 	panic(msg)
 }
+
+var DefaultTemplate = template.Must(template.New("defaultTemplate").Parse(`package {{.Package}}
+
+// AUTOMATICALLY GENERATED -- DO NOT MODIFY
+
+import ({{range .Imports}}
+    {{.}}{{end}} 
+    "github.com/jjeffery/errguard"
+)
+
+{{range .Interfaces}}
+type guard{{.Name}} struct{
+    inner {{.Name}}
+}
+
+func newGuard{{.Name}}(inner {{.Name}}) {{.Name}} {
+    return &guard{{.Name}}{ inner: inner }
+}
+{{range .Methods}}
+
+func (g *guard{{.Interface.Name}}) {{.Name}}({{.ParamDecl}}) ({{.ResultDecl}}) {
+    var guard errguard.Guard
+    {{.ErrorVar}} = guard.Run({{.ContextExpr}}, func() error {
+        {{.ResultNames}} = g.inner.{{.Name}}({{.ArgNames}})
+        return {{.ErrorVar}}
+    })
+    return {{.ResultNames}}
+}
+{{end}}
+{{end}}`))

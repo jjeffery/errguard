@@ -1,67 +1,86 @@
 package main
 
 import (
+	"bytes"
+	"go/format"
 	"go/parser"
 	"go/token"
+	"io"
 	"log"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/jjeffery/errguard/gen"
-	"github.com/kr/pretty"
 	"github.com/spf13/pflag"
 )
 
-var option struct {
-	Type string
+var command struct {
+	Filename string
+	Types    []string
+	Output   string
 }
 
 func main() {
 	log.SetFlags(0)
-
-	pflag.StringVarP(&option.Type, "type", "t", "", "Interface type for errguard implementation")
+	command.Filename = os.Getenv("GOFILE")
+	pflag.StringVarP(&command.Filename, "file", "f", command.Filename, "Source file")
+	pflag.StringVarP(&command.Output, "output", "o", defaultOutput(command.Filename), "Output file")
 	pflag.Parse()
-	if option.Type == "" {
-		log.Fatal("missing --type option")
+	command.Types = pflag.Args()
+	if len(command.Types) == 0 {
+		log.Fatal("no types specified")
 	}
-
-	if d := os.Getenv("DEBUGCD"); d != "" {
-		pwd, _ := os.Getwd()
-		log.Print(pwd)
-		if err := os.Chdir(d); err != nil {
-			log.Fatal(err)
-		}
-	}
-
-	log.Println("environment:")
-	for _, v := range []string{"GOOS", "GOARCH", "GOFILE", "GOLINE", "GOPACKAGE", "DOLLAR"} {
-		log.Printf("    %s=%s", v, os.Getenv(v))
-	}
-	log.Println("options:")
-	log.Printf("    Type=%s", option.Type)
-
-	fileName := os.Getenv("GOFILE")
-	if fileName == "" {
-		log.Fatal("missing GOFILE")
+	if command.Filename == "" {
+		log.Fatal("no file specified (-f or $GOFILE)")
 	}
 
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, fileName, nil, 0)
+	file, err := parser.ParseFile(fset, command.Filename, nil, 0)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	model, err := gen.NewModel(file, []string{option.Type})
+	model, err := gen.NewModel(file, command.Types)
 	if err != nil {
 		log.Fatal(err)
 	}
-	pretty.Print(model)
-	/*
-		log.Println("interface", intf.Name)
-		for _, method := range intf.Methods {
-			log.Printf("%s(%s) (%s)", method.Name, method.ParamDecl, method.ResultDecl)
-			log.Printf("(%s) (%s)", method.ArgNames, method.ResultNames)
-			log.Printf("Error var = %q", method.ErrorVar)
-			log.Printf("Context expr = %q", method.ContextExpr)
-		}*/
 
+	var buf bytes.Buffer
+	if err := gen.DefaultTemplate.Execute(&buf, model); err != nil {
+		log.Fatal(err)
+	}
+
+	formatted, err := format.Source(buf.Bytes())
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	var output io.Writer
+
+	if command.Output == "" || command.Output == "-" {
+		output = os.Stdout
+	} else {
+		outfile, err := os.Create(command.Output)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer outfile.Close()
+		output = outfile
+	}
+
+	if _, err := output.Write(formatted); err != nil {
+		log.Fatal(err)
+	}
+
+	//pretty.Print(model)
+}
+
+func defaultOutput(filename string) string {
+	if filename == "" {
+		return ""
+	}
+	output := strings.TrimSuffix(filename, filepath.Ext(filename))
+	output = output + "_errguard.go"
+	return output
 }
